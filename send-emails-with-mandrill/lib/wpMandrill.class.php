@@ -131,6 +131,7 @@ class wpMandrill {
             // Misc. Plugin Settings
             add_settings_section('wpmandrill-misc', __('Miscellaneous', 'send-emails-with-mandrill'), function(){ echo "<span class='settings_sub_header'>Settings for WordPress plugin. Does not affect email delivery functionality or design.</span>"; }, 'wpmandrill');
             add_settings_field('hide_dashboard_widget', __('Hide WP Dashboard Widget', 'send-emails-with-mandrill'), array(__CLASS__, 'hideDashboardWidget'), 'wpmandrill', 'wpmandrill-misc');
+            add_settings_field('delete_data_on_uninstall', __('Delete data on uninstall', 'send-emails-with-mandrill'), array(__CLASS__, 'askDeleteDataOnUninstall'), 'wpmandrill', 'wpmandrill-misc');
         }
 
         // Fix for WooCommerce
@@ -897,6 +898,21 @@ class wpMandrill {
         <?php
     }
 
+    static function getDeleteDataOnUninstall() {
+        $options = get_option('wpmandrill');
+        return isset($options['delete_data_on_uninstall']) ? $options['delete_data_on_uninstall'] : 0;
+    }
+
+    static function askDeleteDataOnUninstall() {
+        $value = self::getDeleteDataOnUninstall();
+        ?>
+        <div class="inside">
+        <input id="delete_data_on_uninstall" name="wpmandrill[delete_data_on_uninstall]" type="checkbox" <?php echo checked($value, 1); ?> value='1' />
+        <label for="delete_data_on_uninstall"><?php esc_html_e('Check this box if you want all plugin settings and data to be removed when the plugin is deleted.', 'send-emails-with-mandrill'); ?></label>
+        </div>
+        <?php
+    }
+
     static function askTestEmailTo() {
         echo '<div class="inside">';
         ?><input id='email_to' name='wpmandrill-test[email_to]' size='45' type='text' value="<?php echo esc_attr( self::getTestEmailOption('email_to') ); ?>"/><?php
@@ -1624,7 +1640,7 @@ JS;
      * @param array $merge_vars Per-recipient merge variables, which override global merge variables with the same name.
      * @param array $google_analytics_domains An array of strings indicating for which any matching URLs will automatically have Google Analytics parameters appended to their query string automatically.
      * @param array|string $google_analytics_campaign Optional string indicating the value to set for the utm_campaign tracking parameter. If this isn't provided the email's from address will be used instead.
-     * @param array $meta_data Associative array of user metadata. Mandrill will store this metadata and make it available for retrieval. In addition, you can select up to 10 metadata fields to index and make searchable using the Mandrill search api.
+     * @param array $metadata Associative array of user metadata. Mandrill will store this metadata and make it available for retrieval. In addition, you can select up to 10 metadata fields to index and make searchable using the Mandrill search api.
      * @param boolean $important Set the important flag to true for the current email
      * @param boolean $inline_css whether or not to automatically inline all CSS styles provided in the message HTML - only for HTML documents less than 256KB in size
      * @param boolean $preserve_recipients whether or not to expose all recipients in to "To" header for each email
@@ -1652,7 +1668,7 @@ JS;
                           $merge_vars = array(),
                           $google_analytics_domains = array(),
                           $google_analytics_campaign = array(),
-                          $meta_data = array(),
+                          $metadata = array(),
                           $important = false,
                           $inline_css = null,
                           $preserve_recipients=null,
@@ -1678,7 +1694,7 @@ JS;
                 'merge_vars',
                 'google_analytics_domains',
                 'google_analytics_campaign',
-                'meta_data',
+                'metadata',
                 'important',
                 'inline_css',
                 'preserve_recipients',
