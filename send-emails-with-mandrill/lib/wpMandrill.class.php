@@ -9,12 +9,22 @@ add_action( 'wp_mail_native', array( 'wpMandrill', 'wp_mail_native' ), 10, 5 );
 
 class wpMandrill {
     const DEBUG = false;
+
+    // Reject reasons (and recipient statuses) that are tied to the
+    // recipient's address/suppression list rather than to the message
+    // or account, so they should never fall back to the native mailer.
+    const RECIPIENT_LEVEL_REJECT_REASONS = array( 'hard-bounce', 'soft-bounce', 'spam', 'unsub', 'custom', 'invalid' );
+
     static $settings;
     static $report;
     static $stats;
     static $mandrill;
     static $conflict;
     static $error;
+    static $native_mail_result;
+    static $woocommerce_email_subject;
+    static $suppressed_recipients = array();
+    static $last_rejections = array();
 
     static function on_load() {
 
@@ -31,6 +41,9 @@ class wpMandrill {
 
         load_plugin_textdomain('send-emails-with-mandrill', false, dirname( dirname( plugin_basename( __FILE__ ) ) ).'/languages');
 
+        // Registered once all plugins are loaded, since WooCommerce may load after this plugin.
+        add_action( 'plugins_loaded', array( __CLASS__, 'registerWooCommerceFix' ) );
+
         if( function_exists('wp_mail') ) {
             self::$conflict = true;
             return;
@@ -40,16 +53,69 @@ class wpMandrill {
         if( self::isConfigured() ) {
 
             function wp_mail( $to, $subject, $message, $headers = '', $attachments = array() ) {
-                try {
-                    $response = wpMandrill::mail( $to, $subject, $message, $headers, $attachments );
-                    return wpMandrill::evaluate_response( $response );
-                } catch ( Exception $e ) {
-                    error_log( 'Mandrill error: ' . $e->getMessage() );
-                    do_action( 'wp_mail_native', $to, $subject, $message, $headers, $attachments );
-                }
+                return wpMandrill::send_mail( $to, $subject, $message, $headers, $attachments );
             }
         }
 
+    }
+
+    /**
+     * Sends an e-mail through Mandrill, falling back to the native WordPress
+     * mailer (via the `wp_mail_native` action) if the Mandrill API call fails.
+     *
+     * @return boolean
+     */
+    static function send_mail( $to, $subject, $message, $headers = '', $attachments = array() ) {
+        self::$suppressed_recipients = array();
+        self::$last_rejections       = array();
+        try {
+            $response = self::mail( $to, $subject, $message, $headers, $attachments );
+            $result   = self::evaluate_response( $response );
+
+            if ( false === $result ) {
+                $reasons = array();
+                foreach ( self::$last_rejections as $rejection ) {
+                    $reasons[] = ( isset( $rejection['email'] ) ? $rejection['email'] : '?' ) . ' (' . ( isset( $rejection['reject_reason'] ) ? $rejection['reject_reason'] : $rejection['status'] ) . ')';
+                }
+                $error_message = 'Mandrill rejected all recipients: ' . implode( ', ', $reasons );
+
+                do_action( 'wp_mail_failed', new WP_Error( 'wp_mail_failed', $error_message, compact( 'to', 'subject', 'message', 'headers', 'attachments' ) + array( 'rejections' => self::$last_rejections ) ) );
+            }
+
+            return $result;
+        } catch ( Exception $e ) {
+            error_log( 'Mandrill error: ' . $e->getMessage() );
+            self::$native_mail_result = null;
+
+            $to = self::excludeSuppressedRecipients( $to );
+            if ( empty( $to ) ) {
+                error_log( 'Mandrill error (native fallback): skipped, all recipients were suppressed by Mandrill.' );
+                return false;
+            }
+
+            try {
+                do_action( 'wp_mail_native', $to, $subject, $message, $headers, $attachments );
+            } catch ( \Throwable $e ) {
+                error_log( 'Mandrill error (native fallback): ' . $e->getMessage() );
+                return false;
+            }
+            return is_bool( self::$native_mail_result ) ? self::$native_mail_result : false;
+        }
+    }
+
+    /**
+     * @param array $result A single recipient result from a Mandrill /messages/send response.
+     * @return boolean Whether the rejection is tied to the recipient's address (suppression
+     *                 list) rather than to the message or account.
+     */
+    static function isRecipientLevelRejection( array $result ) {
+        if ( isset( $result['status'] ) && 'invalid' === $result['status'] )
+            return true;
+
+        return isset( $result['status'] )
+            && 'rejected' === $result['status']
+            && isset( $result['reject_reason'] )
+            && in_array( $result['reject_reason'], self::RECIPIENT_LEVEL_REJECT_REASONS, true );
     }
 
     /**
@@ -63,20 +129,96 @@ class wpMandrill {
 
         if ( !isset( $response[0]['status'] ) )
             throw new Exception( esc_html( 'Email status was not provided in response.' ) );
-	    
+
 	    do_action( 'mandrill_response_received', $response );
 
-        if (
-            'rejected' === $response[0]['status']
-            && isset( $response[0]['reject_reason'] )
-            && 'hard-bounce' !== $response[0]['reject_reason'] # Exclude hard bounces (email address doesn't exist).
-        )
-            throw new Exception( esc_html( 'Email was rejected due to the following reason: ' . esc_html( $response[0]['reject_reason'] ) . '.' ) );
+        self::$suppressed_recipients = array();
+        self::$last_rejections       = array();
 
-        if ( !in_array( $response[0]['status'], array( 'sent', 'queued' ) ) )
-            throw new Exception( esc_html( 'Email was not sent or queued. Response: ' ) . esc_html( json_encode( $response ) ) );
+        $accepted             = false;
+        $recipient_rejections = array();
+        $all_recipient_level  = true;
 
-        return true;
+        foreach ( $response as $result ) {
+            if ( !is_array( $result ) ) {
+                $all_recipient_level = false;
+                continue;
+            }
+
+            if ( isset( $result['status'] ) && in_array( $result['status'], array( 'sent', 'queued', 'scheduled' ), true ) ) {
+                $accepted = true;
+                continue;
+            }
+
+            if ( self::isRecipientLevelRejection( $result ) ) {
+                $recipient_rejections[] = $result;
+            } else {
+                $all_recipient_level = false;
+            }
+        }
+
+        // At least one recipient accepted the message: never fall back to the
+        // native mailer, since that would re-send (duplicate) to the recipients
+        // Mandrill already accepted. Rejected recipients simply don't get it,
+        // same as Mandrill's own behavior.
+        if ( $accepted )
+            return true;
+
+        // Nothing was accepted, but every rejection is recipient-level (e.g. the
+        // recipient unsubscribed or is on the suppression list): honor that and
+        // report failure without falling back, so suppressed addresses can't be
+        // reached via the native mailer.
+        if ( $all_recipient_level ) {
+            self::$last_rejections = $recipient_rejections;
+
+            $reasons = array();
+            foreach ( $recipient_rejections as $result ) {
+                $reasons[] = ( isset( $result['email'] ) ? $result['email'] : '?' ) . ': ' . ( isset( $result['reject_reason'] ) ? $result['reject_reason'] : $result['status'] );
+            }
+            error_log( 'Mandrill: email not delivered, all recipients were rejected (' . implode( ', ', $reasons ) . ').' );
+            return false;
+        }
+
+        // At least one failure is message/account-level (e.g. invalid sender):
+        // fall back to the native mailer, but remember which recipients were
+        // rejected for recipient-level reasons so send_mail() can exclude them
+        // from that fallback.
+        foreach ( $recipient_rejections as $result ) {
+            if ( isset( $result['email'] ) )
+                self::$suppressed_recipients[] = $result['email'];
+        }
+
+        throw new Exception( esc_html( 'Email was not sent or queued. Response: ' ) . esc_html( json_encode( $response ) ) );
+    }
+
+    /**
+     * Removes any addresses recorded in self::$suppressed_recipients (set by
+     * evaluate_response()) from a wp_mail() $to value, so the native-mailer
+     * fallback doesn't bypass Mandrill's rejection/suppression list.
+     *
+     * @param array|string $to
+     * @return array|string Same shape as $to was given.
+     */
+    static function excludeSuppressedRecipients( $to ) {
+        if ( empty( self::$suppressed_recipients ) )
+            return $to;
+
+        $suppressed = array_map( 'strtolower', self::$suppressed_recipients );
+
+        $was_string = !is_array( $to );
+        $list       = $was_string ? explode( ',', $to ) : $to;
+
+        $filtered = array();
+        foreach ( $list as $recipient ) {
+            $email = trim( $recipient );
+            if ( preg_match( '/<(.+)>/', $email, $matches ) )
+                $email = $matches[1];
+
+            if ( !in_array( strtolower( trim( $email ) ), $suppressed, true ) )
+                $filtered[] = trim( $recipient );
+        }
+
+        return $was_string ? implode( ', ', $filtered ) : $filtered;
     }
 
     /**
@@ -138,21 +280,27 @@ class wpMandrill {
             add_settings_field('delete_data_on_uninstall', __('Delete data on uninstall', 'send-emails-with-mandrill'), array(__CLASS__, 'askDeleteDataOnUninstall'), 'wpmandrill', 'wpmandrill-misc');
         }
 
-        // Fix for WooCommerce
-        if( self::getnl2brWooCommerce() ) {
-            add_action( 'woocommerce_email', function() {
-                add_filter( 'mandrill_nl2br', '__return_false' );
-            }, 10, 1 );
-        }
-
         // Activate the cron job that will update the stats
         add_action('wpm_update_stats', array(__CLASS__,'saveProcessedStats'));
 
-        if ( !wp_next_scheduled( 'wpm_update_stats' ) ) {
-            wp_schedule_event( current_time( 'timestamp', 1 ), 'hourly', 'wpm_update_stats');
-        }
+        self::maybeScheduleStatsCron();
 
         register_deactivation_hook( __FILE__, array(__CLASS__,'deactivate') );
+    }
+
+    /**
+     * Schedules the hourly stats cron event when reports are enabled, or
+     * clears it when they're disabled, so disabled sites don't keep making
+     * Mandrill API calls to feed stats nobody can see.
+     */
+    static function maybeScheduleStatsCron() {
+        if ( self::reportsEnabled() ) {
+            if ( !wp_next_scheduled( 'wpm_update_stats' ) ) {
+                wp_schedule_event( current_time( 'timestamp', 1 ), 'hourly', 'wpm_update_stats');
+            }
+        } elseif ( wp_next_scheduled( 'wpm_update_stats' ) ) {
+            wp_clear_scheduled_hook('wpm_update_stats');
+        }
     }
 
     static public function deactivate() {
@@ -173,7 +321,7 @@ class wpMandrill {
         );
         add_action( 'load-'.self::$settings, array(__CLASS__,'showContextualHelp'));
 	    
-        if( self::isConfigured() && apply_filters( 'wpmandrill_enable_reports', true ) ) {
+        if( self::isConfigured() && self::reportsEnabled() ) {
             if (current_user_can('manage_options')) self::$report = add_dashboard_page(
                 __('Mandrill Reports', 'send-emails-with-mandrill'),
                 __('Mandrill Reports', 'send-emails-with-mandrill'),
@@ -470,6 +618,13 @@ class wpMandrill {
     /**
      * @return boolean
      */
+    static function reportsEnabled() {
+        return (bool) apply_filters( 'wpmandrill_enable_reports', true );
+    }
+
+    /**
+     * @return boolean
+     */
     static function setOption( $name, $value ) {
 
         $options = get_option('wpmandrill');
@@ -554,15 +709,15 @@ class wpMandrill {
     }
 
     /**
-     * @return string|boolean
+     * @return bool
      */
     static function isWooCommerceActive() {
-        // If WooCommerce is not active, we can ignore
-        if ( !class_exists( 'WooCommerce' ) ) {
-            return false;
-        }
-
-        return true;
+        /**
+         * Filters whether WooCommerce is considered active.
+         *
+         * @param bool $active Whether WooCommerce is active. Default: class_exists( 'WooCommerce' ).
+         */
+        return (bool) apply_filters( 'wpmandrill_is_woocommerce_active', class_exists( 'WooCommerce' ) );
     }
 
     /**
@@ -574,6 +729,62 @@ class wpMandrill {
             return false;
 
         return self::getOption('nl2br_woocommerce');
+    }
+
+    /**
+     * Registers the hooks that skip the nl2br transformation for
+     * WooCommerce-sent emails only, without affecting any other email
+     * sent during the same request.
+     *
+     * Needs to run on every request (front end, admin and cron alike),
+     * since WooCommerce sends emails from all three contexts.
+     */
+    static function registerWooCommerceFix() {
+        if ( ! self::getnl2brWooCommerce() ) {
+            return;
+        }
+
+        add_filter( 'woocommerce_mail_callback_params', array( __CLASS__, 'markWooCommerceEmail' ), PHP_INT_MAX, 2 );
+        add_action( 'woocommerce_email_sent', array( __CLASS__, 'clearWooCommerceEmail' ) );
+        add_filter( 'mandrill_nl2br', array( __CLASS__, 'disableNl2brForWooCommerce' ), 10, 2 );
+    }
+
+    /**
+     * Records the subject of the WooCommerce email that is about to be sent,
+     * so it can be matched against the message mandrill_nl2br is filtering.
+     *
+     * @param array $params
+     * @return array
+     */
+    static function markWooCommerceEmail( $params ) {
+        if ( is_array( $params ) && isset( $params[1] ) ) {
+            self::$woocommerce_email_subject = $params[1];
+        }
+
+        return $params;
+    }
+
+    /**
+     * Clears the pending WooCommerce email marker once WooCommerce is done
+     * sending it.
+     */
+    static function clearWooCommerceEmail() {
+        self::$woocommerce_email_subject = null;
+    }
+
+    /**
+     * @param boolean $nl2br
+     * @param array $message
+     * @return boolean
+     */
+    static function disableNl2brForWooCommerce( $nl2br, $message ) {
+        if ( self::$woocommerce_email_subject !== null && isset( $message['subject'] ) && $message['subject'] === self::$woocommerce_email_subject ) {
+            self::$woocommerce_email_subject = null;
+
+            return false;
+        }
+
+        return $nl2br;
     }
 
     /**
@@ -660,7 +871,13 @@ class wpMandrill {
 
         if ( empty($template) || !self::isConnected() ) return false;
 
-        $templates = self::$mandrill->templates_list();
+        try {
+            $templates = self::$mandrill->templates_list();
+        } catch ( Exception $e ) {
+            error_log( gmdate('Y-m-d H:i:s') . ' wpMandrill::isTemplateValid: ' . $e->getMessage() . "\n" );
+            return false;
+        }
+
         foreach ( $templates as $curtemplate )  {
 			if ( $curtemplate['name'] == $template || $curtemplate['slug'] == $template) {
                 return true;
@@ -731,7 +948,14 @@ class wpMandrill {
             $api_is_valid = false;
 
             self::getConnected();
-            if ( self::isConnected() ) $api_is_valid = ( self::$mandrill->users_ping() == 'PONG!' );
+            if ( self::isConnected() ) {
+                try {
+                    $api_is_valid = ( self::$mandrill->users_ping() == 'PONG!' );
+                } catch ( Exception $e ) {
+                    error_log( gmdate('Y-m-d H:i:s') . ' wpMandrill::askAPIKey: ' . $e->getMessage() . "\n" );
+                    $api_is_valid = false;
+                }
+            }
 
             if ( !$api_is_valid ) {
                 ?><br/><span class="setting-description"><small><em><?php esc_html_e('Sorry. Invalid API key.', 'send-emails-with-mandrill'); ?></em></small></span><?php
@@ -803,7 +1027,14 @@ class wpMandrill {
         }
 
         $template  = self::getTemplate();
-        $templates = self::$mandrill->templates_list();
+
+        try {
+            $templates = self::$mandrill->templates_list();
+        } catch ( Exception $e ) {
+            error_log( gmdate('Y-m-d H:i:s') . ' wpMandrill::askTemplate: ' . $e->getMessage() . "\n" );
+            $templates = array();
+        }
+
         if( is_wp_error($templates) || empty($templates)) {
 
             esc_html_e('No templates found.', 'send-emails-with-mandrill');
@@ -958,6 +1189,23 @@ class wpMandrill {
      * @return array
      */
     static function getRawStatistics() {
+        if ( !self::reportsEnabled() ) {
+            return array();
+        }
+
+        // Mandrill::request() throws on any API error; never let that escape into a wp-admin page render.
+        try {
+            return self::fetchRawStatistics();
+        } catch ( Exception $e ) {
+            error_log( gmdate('Y-m-d H:i:s') . ' wpMandrill::getRawStatistics: ' . $e->getMessage() . "\n" );
+            return array();
+        }
+    }
+
+    /**
+     * @return array
+     */
+    private static function fetchRawStatistics() {
         self::getConnected();
         if ( !self::isConnected() ) {
             error_log( gmdate('Y-m-d H:i:s') . " wpMandrill::getRawStatistics: Not Connected to Mandrill \n" );
@@ -1108,6 +1356,10 @@ class wpMandrill {
      * saved stats if found... and if there's none saved, it creates it directly from Mandrill.
      */
     static function getCurrentStats() {
+        if ( !self::reportsEnabled() ) {
+            return array();
+        }
+
         if( is_array($_GET) ){
             if( array_key_exists('fetch_new', $_GET) && $_GET['fetch_new']=='asap'){
                 $stats = self::saveProcessedStats();
@@ -1135,6 +1387,10 @@ class wpMandrill {
      * @return array The saved stats
      */
     static function saveProcessedStats() {
+        if ( !self::reportsEnabled() ) {
+            return array();
+        }
+
         $stats = self::GetProcessedStats();
         if ( !empty($stats) ) {
             set_transient('wpmandrill-stats', $stats, 60 * 60);
@@ -1148,6 +1404,8 @@ class wpMandrill {
 
     static function addDashboardWidgets() {
         if (!current_user_can('manage_options') || self::getOption('hide_dashboard_widget')) return;
+
+        if ( !self::reportsEnabled() ) return;
 
         self::getConnected();
         if ( !self::isConnected() || !apply_filters( 'wpmandrill_enable_widgets', true ) ) return;
@@ -1191,6 +1449,10 @@ class wpMandrill {
 
     static function showDashboardWidget() {
         if (!current_user_can('manage_options')) {
+            return;
+        }
+
+        if ( !self::reportsEnabled() ) {
             return;
         }
 
@@ -1407,6 +1669,10 @@ class wpMandrill {
 
         if ( !isset($_POST['_wpnonce']) || !wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['_wpnonce'])), 'get_mandrill_stats_nonce') ) {
             wp_send_json_error('Invalid nonce');
+            exit();
+        }
+
+        if ( !self::reportsEnabled() ) {
             exit();
         }
 
@@ -1692,7 +1958,36 @@ jQuery(function () {
         if ( $track_clicks === null ) $track_clicks = self::getTrackClicks();
 
         try {
-            extract( apply_filters( 'wp_mail', compact( 'to', 'subject', 'html', 'headers', 'attachments' ) ) );
+            $original_html = $html;
+
+            // WordPress core (and mail-logging plugins such as WP Mail Catcher) expect the
+            // body under the 'message' key; 'html' is kept as a deprecated alias so existing
+            // filter callbacks written against this plugin's previous behavior keep working.
+            $wp_mail_args = apply_filters( 'wp_mail', array(
+                'to'          => $to,
+                'subject'     => $subject,
+                'message'     => $html,
+                'headers'     => $headers,
+                'attachments' => $attachments,
+                'html'        => $html,
+            ) );
+
+            if ( ! is_array( $wp_mail_args ) ) {
+                error_log( 'Mandrill error: wp_mail filter returned a non-array value, ignoring it' );
+            } else {
+                if ( isset( $wp_mail_args['to'] ) )          $to          = $wp_mail_args['to'];
+                if ( isset( $wp_mail_args['subject'] ) )     $subject     = $wp_mail_args['subject'];
+                if ( isset( $wp_mail_args['headers'] ) )     $headers     = $wp_mail_args['headers'];
+                if ( isset( $wp_mail_args['attachments'] ) ) $attachments = $wp_mail_args['attachments'];
+
+                if ( isset( $wp_mail_args['html'] ) && $wp_mail_args['html'] !== $original_html
+                    && ( ! isset( $wp_mail_args['message'] ) || $wp_mail_args['message'] === $original_html ) ) {
+                    $html = $wp_mail_args['html'];
+                } elseif ( isset( $wp_mail_args['message'] ) ) {
+                    $html = $wp_mail_args['message'];
+                }
+            }
+
             $message = compact('html', 'subject', 'from_name', 'from_email', 'to', 'headers', 'attachments',
                 'url_strip_qs',
                 'merge',
@@ -1717,7 +2012,7 @@ jQuery(function () {
             return self::sendEmail($message, $tags, $template_name, $track_opens, $track_clicks);
         } catch ( Exception $e ) {
             error_log( "\nwpMandrill::mail: Exception Caught => ".$e->getMessage()."\n" );
-            return new WP_Error( $e->getMessage() );
+            return new WP_Error( 'wpmandrill_error', $e->getMessage() );
         }
     }
 
@@ -1725,7 +2020,14 @@ jQuery(function () {
      * @return boolean
      */
     static function wp_mail_native( $to, $subject, $message, $headers = '', $attachments = array() ) {
-        require SEWM_PATH . '/legacy/function.wp_mail.php';
+        try {
+            self::$native_mail_result = (bool) require SEWM_PATH . '/legacy/function.wp_mail.php';
+        } catch ( \Throwable $e ) {
+            error_log( 'Mandrill error (native mailer): ' . $e->getMessage() );
+            self::$native_mail_result = false;
+        }
+
+        return self::$native_mail_result;
     }
 
     /**
@@ -1750,6 +2052,9 @@ jQuery(function () {
              *  Processing supplied fields to make them valid for the Mandrill API
              *
              *************************/
+
+            // Cc: addresses collected from the headers, added to the 'to' list below
+            $cc_addresses = array();
 
             // Checking the user-specified headers
             if ( empty( $message['headers'] ) ) {
@@ -1801,6 +2106,13 @@ jQuery(function () {
                                 $message['bcc_address'] = $bcc[0];
                                 break;
 
+                            case 'cc':
+                                foreach ( explode( ',', $content ) as $cc_address ) {
+                                    $cc_address = trim( $cc_address );
+                                    if ( $cc_address !== '' ) $cc_addresses[] = $cc_address;
+                                }
+                                break;
+
                             case 'reply-to':
                                 $message['headers'][trim( $name )] = trim( $content );
                                 break;
@@ -1810,7 +2122,7 @@ jQuery(function () {
                                 if ( !$message['important'] ) $message['important'] = ( strpos(strtolower($content),'high') !== false ) ? true : false;
                                 break;
                             default:
-                                if ( substr($name,0,2) == 'x-' ) {
+                                if ( strtolower( substr($name,0,2) ) === 'x-' ) {
                                     $message['headers'][trim( $name )] = trim( $content );
                                 }
                                 break;
@@ -1837,6 +2149,13 @@ jQuery(function () {
                 }
             }
             $message['to'] = $processed_to;
+
+            // Checking Cc: field
+            if ( !empty( $cc_addresses ) ) {
+                foreach ( $cc_addresses as $cc_address ) {
+                    $message['to'][] = self::ensureEmailFormatting( $cc_address, 'cc' );
+                }
+            }
 
             // Checking From: field
             if ( empty($message['from_email']) ) $message['from_email'] = self::getFromEmail();
@@ -1934,7 +2253,7 @@ jQuery(function () {
 
         } catch ( Exception $e) {
             error_log( gmdate('Y-m-d H:i:s') . " wpMandrill::sendEmail: Exception Caught => ".$e->getMessage()."\n" );
-            return new WP_Error( $e->getMessage() );
+            return new WP_Error( 'wpmandrill_error', $e->getMessage() );
         }
     }
 
@@ -1947,7 +2266,7 @@ jQuery(function () {
                 $attachments[$index] = Mandrill::getAttachmentStruct($attachment);
             } catch ( Exception $e ) {
                 error_log( "\nwpMandrill::processAttachments: $attachment => ".$e->getMessage()."\n" );
-                return new WP_Error( $e->getMessage() );
+                return new WP_Error( 'wpmandrill_attachment_error', $e->getMessage() );
             }
         }
 
@@ -1980,13 +2299,16 @@ jQuery(function () {
             if ( count( $matches ) == 3 ) {
                 return array(
                     'email' => $matches[2],
-                    'name' => $matches[1],
+                    'name' => trim( $matches[1] ),
                     'type' => $type
                 );
             }
         }
-        
-        return array( 'email' => $email );
+
+        $formatted = array( 'email' => $email );
+        if ( $type !== 'to' ) $formatted['type'] = $type;
+
+        return $formatted;
     }
 }
 

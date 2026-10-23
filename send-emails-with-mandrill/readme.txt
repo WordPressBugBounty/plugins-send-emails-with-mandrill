@@ -3,8 +3,8 @@ Contributors: MillerMediaNow, mikemm01, MC_Will, MC_Amanda, cornelraiu-1, crstau
 Tags: mandrill, mailchimp, email, smtp, wp_mail
 Requires PHP: 8.1
 Requires at least: 3.0
-Tested up to: 6.9
-Stable tag: 1.6.2
+Tested up to: 7.1
+Stable tag: 1.6.5
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -178,6 +178,26 @@ If your account has more than 20 senders registered or more than 40 tags used, t
 4. Dashboard widget Settings
 
 == Changelog ==
+
+= 1.6.5 =
+* The WooCommerce line-break fix now applies only to emails sent by WooCommerce, so other emails on WooCommerce sites keep their line breaks (GitHub #82, #84)
+* Recipients that Mandrill rejects (unsubscribed, spam complaint, bounced or invalid) no longer receive the email through the fallback mailer
+* New behavior: if Mandrill rejects every recipient, wp_mail() now returns false and fires the wp_mail_failed action with the rejection reasons instead of falling back to the native mailer
+* Disabling reports now stops the background stats API calls and hides the dashboard widget
+
+= 1.6.4 =
+* Fixed Cc: headers being dropped; CC recipients are now passed through to Mandrill (GitHub #46)
+* The wp_mail filter now passes the email body as 'message' again (the 'html' key is kept for compatibility), which fixes mail-logging plugins; a filter that returns a non-array value no longer causes a crash
+* Mandrill API requests now verify SSL certificates, and stats/admin calls use a shorter 15-second timeout so wp-admin no longer hangs when Mandrill is slow (sending keeps the longer timeout). Added a new mandrill_http_request_args filter to adjust request arguments
+* Error logs now include the actual error message from Mandrill or WordPress instead of an empty message (GitHub #90)
+* Mandrill API errors no longer crash the dashboard widget, reports and settings pages
+* Custom X-* headers are no longer dropped when they aren't written in lowercase
+
+= 1.6.3 =
+* Fixed wp_mail() returning null instead of a boolean on the native mail fallback path, which caused a TypeError in WooCommerce 10.9+ checkout (GitHub #152)
+* wp_mail_native() now returns the native mailer's actual result instead of discarding it
+* Caught exceptions thrown by the native mailer so they can no longer escape wp_mail() uncaught
+* Updated "Tested up to" to 7.1
 
 = 1.6.2 =
 * Added ABSPATH checks to how-tos.php, lib/reviewNotice.class.php, lib/pluginActivation.class.php, stats.php
